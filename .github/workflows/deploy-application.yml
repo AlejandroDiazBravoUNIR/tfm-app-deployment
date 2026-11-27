@@ -7,8 +7,8 @@ on:
         description: Formulario de Port (JSON)
         required: true
         type: string
-      port_run_id:
-        description: ID de la ejecución en Port
+      port_context:
+        description: Contexto JSON de Port Workflow, incluido el ID de ejecución del nodo
         required: false
         type: string
         default: ""
@@ -21,21 +21,42 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      PORT_RUN_ID: ${{ inputs.port_run_id }}
+      PORT_WORKFLOW_NODE_RUN_ID: ${{ inputs.port_context != '' && (fromJSON(inputs.port_context).workflow_node_run_id || fromJSON(inputs.port_context).workflowNodeRunId || fromJSON(inputs.port_context).node_run_id || fromJSON(inputs.port_context).nodeRunId || '') || '' }}
       PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
       PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
       PORT_API_URL: ${{ vars.PORT_API_URL }}
       ORG: ${{ github.repository_owner }}
     steps:
-      - name: Leer formulario
-        id: form
+      - name: Resolver identificador de aplicación
+        id: application
         env:
           JSON_DATA: ${{ inputs.json_data }}
         run: |
           set -euo pipefail
-          env_name=$(jq -r '.environment_name' <<<"$JSON_DATA")
-          app_name=$(jq -r '.app_name' <<<"$JSON_DATA")
-          app_version=$(jq -r '.app_version // empty' <<<"$JSON_DATA")
+          jq -e . <<<"$JSON_DATA" >/dev/null || { echo "::error::json_data no es JSON válido"; exit 1; }
+          identifier=$(jq -r 'if type == "string" then . elif type == "object" then (.application // "") else "" end' <<<"$JSON_DATA")
+          echo "identifier=$identifier" >> "$GITHUB_OUTPUT"
+
+      - name: Obtener propiedades de la aplicación en Port
+        id: port_entity
+        if: ${{ steps.application.outputs.identifier != '' }}
+        uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-get-entity@main
+        with:
+          blueprint: idp_application
+          identifier: ${{ steps.application.outputs.identifier }}
+
+      - name: Leer formulario
+        id: form
+        env:
+          JSON_DATA: ${{ inputs.json_data }}
+          APP_PROPERTIES: ${{ steps.port_entity.outputs.properties }}
+        run: |
+          set -euo pipefail
+          APP_DATA="$APP_PROPERTIES"
+          if [[ -z "$APP_DATA" ]]; then APP_DATA="$JSON_DATA"; fi
+          env_name=$(jq -r '.environment_name // empty' <<<"$APP_DATA")
+          app_name=$(jq -r '.app_name // empty' <<<"$APP_DATA")
+          app_version=$(jq -r '.app_version // empty' <<<"$APP_DATA")
           [[ "$env_name" =~ ^[a-z][a-z0-9-]{2,20}$ ]] || { echo "::error::environment_name inválido"; exit 1; }
           [[ "$app_name" =~ ^[a-z][a-z0-9-]{1,20}$ ]] || { echo "::error::app_name inválido"; exit 1; }
           { echo "prefix=${env_name}-${app_name}"; echo "env_name=$env_name"; echo "app_name=$app_name"; echo "app_version=$app_version"; } >> "$GITHUB_OUTPUT"
@@ -65,18 +86,18 @@ jobs:
             if [ "$(v RUNTIME)" = node ]; then echo "tech=nodejs"; else echo "tech=python"; fi
           } >> "$GITHUB_OUTPUT"
 
-      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-log@main
+      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-workflow-report@main
         with:
-          message: "⏳ [4/4] Aplicando configuración en ${{ steps.form.outputs.prefix }}-app (PR + merge)..."
+          log_message: "[4/4] Aplicando configuración en ${{ steps.form.outputs.prefix }}-app (PR + merge)..."
 
       - name: Fusionar placeholders
         uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/merge-placeholding@main
         with:
           repo: ${{ github.repository_owner }}/${{ steps.form.outputs.prefix }}-app
 
-      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-log@main
+      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-workflow-report@main
         with:
-          message: "⏳ [4/4] Pipeline CI/CD en marcha: tests, build, Trivy, push a ECR y despliegue en ECS..."
+          log_message: "[4/4] Pipeline CI/CD en marcha: tests, build, Trivy, push a ECR y despliegue en ECS..."
 
       - name: Pipeline CI/CD de la aplicación
         uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/dispatch-and-wait@main
@@ -126,11 +147,11 @@ jobs:
              "status":"running"}
           relations: '{"environment":"${{ steps.form.outputs.env_name }}"}'
 
-      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-log@main
+      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-workflow-report@main
         with:
-          message: "✅ [4/4] Aplicación desplegada y accesible en ${{ steps.net.outputs.url }}"
+          log_message: "[4/4] Aplicación desplegada y accesible en ${{ steps.net.outputs.url }}"
 
       - if: ${{ failure() }}
-        uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-log@main
+        uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-workflow-report@main
         with:
-          message: "❌ [4/4] Falló el despliegue de la aplicación. Ver ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          log_message: "[4/4] Falló el despliegue de la aplicación. Ver ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
