@@ -1,0 +1,136 @@
+name: AS4 - Desplegar aplicación
+
+on:
+  workflow_dispatch:
+    inputs:
+      json_data:
+        description: Formulario de Port (JSON)
+        required: true
+        type: string
+      port_run_id:
+        description: ID de la ejecución en Port
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      PORT_RUN_ID: ${{ inputs.port_run_id }}
+      PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
+      PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+      PORT_API_URL: ${{ vars.PORT_API_URL }}
+      ORG: ${{ github.repository_owner }}
+    steps:
+      - name: Leer formulario
+        id: form
+        env:
+          JSON_DATA: ${{ inputs.json_data }}
+        run: |
+          set -euo pipefail
+          env_name=$(jq -r '.environment_name' <<<"$JSON_DATA")
+          app_name=$(jq -r '.app_name' <<<"$JSON_DATA")
+          app_version=$(jq -r '.app_version // empty' <<<"$JSON_DATA")
+          [[ "$env_name" =~ ^[a-z][a-z0-9-]{2,20}$ ]] || { echo "::error::environment_name inválido"; exit 1; }
+          [[ "$app_name" =~ ^[a-z][a-z0-9-]{1,20}$ ]] || { echo "::error::app_name inválido"; exit 1; }
+          { echo "prefix=${env_name}-${app_name}"; echo "env_name=$env_name"; echo "app_name=$app_name"; echo "app_version=$app_version"; } >> "$GITHUB_OUTPUT"
+
+      - id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.IDP_APP_ID }}
+          private-key: ${{ secrets.IDP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - run: echo "GH_TOKEN=${{ steps.app.outputs.token }}" >> "$GITHUB_ENV"
+
+      - name: Leer configuración del repo de la app
+        id: cfg
+        env:
+          REPO: ${{ github.repository_owner }}/${{ steps.form.outputs.prefix }}-app
+          NEW_VERSION: ${{ steps.form.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$NEW_VERSION" ]; then gh variable set APP_VERSION --body "$NEW_VERSION" -R "$REPO"; fi
+          v() { gh variable get "$1" -R "$REPO"; }
+          {
+            echo "region=$(v AWS_REGION)"; echo "cluster=$(v ECS_CLUSTER)"; echo "service=$(v ECS_SERVICE)"
+            echo "port=$(v CONTAINER_PORT)"; echo "version=$(v APP_VERSION)"
+            echo "tech_version=$(v TECH_VERSION)"; echo "runtime=$(v RUNTIME)"
+            if [ "$(v RUNTIME)" = node ]; then echo "tech=nodejs"; else echo "tech=python"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-log@main
+        with:
+          message: "⏳ [4/4] Aplicando configuración en ${{ steps.form.outputs.prefix }}-app (PR + merge)..."
+
+      - name: Fusionar placeholders
+        uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/merge-placeholding@main
+        with:
+          repo: ${{ github.repository_owner }}/${{ steps.form.outputs.prefix }}-app
+
+      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-log@main
+        with:
+          message: "⏳ [4/4] Pipeline CI/CD en marcha: tests, build, Trivy, push a ECR y despliegue en ECS..."
+
+      - name: Pipeline CI/CD de la aplicación
+        uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/dispatch-and-wait@main
+        with:
+          repo: ${{ github.repository_owner }}/${{ steps.form.outputs.prefix }}-app
+          workflow: ci-on-push.yml
+
+      - name: Credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PLATFORM_ROLE_ARN }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+
+      - name: Localizar IP pública y comprobar /health
+        id: net
+        env:
+          CLUSTER: ${{ steps.cfg.outputs.cluster }}
+          SERVICE: ${{ steps.cfg.outputs.service }}
+          PORT_C: ${{ steps.cfg.outputs.port }}
+        run: |
+          set -euo pipefail
+          TASK=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --desired-status RUNNING --query 'taskArns[0]' --output text)
+          [ "$TASK" != "None" ] || { echo "::error::No hay tareas en ejecución"; exit 1; }
+          CI=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" --query 'tasks[0].containerInstanceArn' --output text)
+          EC2=$(aws ecs describe-container-instances --cluster "$CLUSTER" --container-instances "$CI" --query 'containerInstances[0].ec2InstanceId' --output text)
+          IP=$(aws ec2 describe-instances --instance-ids "$EC2" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          URL="http://$IP:$PORT_C"
+          echo "URL: $URL"
+          curl -fsS --retry 12 --retry-delay 5 --retry-connrefused --max-time 10 "$URL/health"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Actualizar aplicación en el catálogo de Port
+        uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-upsert@main
+        with:
+          blueprint: idp_application
+          identifier: ${{ steps.form.outputs.prefix }}
+          title: ${{ steps.form.outputs.app_name }} (${{ steps.form.outputs.env_name }})
+          properties: >-
+            {"app_name":"${{ steps.form.outputs.app_name }}",
+             "environment_name":"${{ steps.form.outputs.env_name }}",
+             "technology":"${{ steps.cfg.outputs.tech }}",
+             "tech_version":"${{ steps.cfg.outputs.tech_version }}",
+             "app_version":"${{ steps.cfg.outputs.version }}",
+             "infra_repo":"https://github.com/${{ github.repository_owner }}/${{ steps.form.outputs.prefix }}-infra",
+             "app_repo":"https://github.com/${{ github.repository_owner }}/${{ steps.form.outputs.prefix }}-app",
+             "app_url":"${{ steps.net.outputs.url }}",
+             "status":"running"}
+          relations: '{"environment":"${{ steps.form.outputs.env_name }}"}'
+
+      - uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-log@main
+        with:
+          message: "✅ [4/4] Aplicación desplegada y accesible en ${{ steps.net.outputs.url }}"
+
+      - if: ${{ failure() }}
+        uses: AlejandroDiazBravoUNIR/tfm-reusable-workflows/.github/actions/port-log@main
+        with:
+          message: "❌ [4/4] Falló el despliegue de la aplicación. Ver ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
